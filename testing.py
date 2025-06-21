@@ -1,6 +1,5 @@
 import trueskillthroughtime as t
 import ttt
-
 import time
 
 def compare_functions(func_a, func_b, *args, iterations=1_000_000, **kwargs):
@@ -61,7 +60,11 @@ def compare_functions(func_a, func_b, *args, iterations=1_000_000, **kwargs):
     print(f"Outputs match:   {outputs_match}")
     print(f"Speedup:         {time_a/time_b:.2f}x")
     print(f"Total calls:     {iterations:,}\n")
-    
+
+def compare_gaussians(g1, g2, tol=1e-9):
+    """Compare two Gaussian tuples (mu1, sigma1) and (mu2, sigma2) within tolerance."""
+    return (abs(g1[0] - g2[0]) < tol) and (abs(g1[1] - g2[1]) < tol)
+
 # print("\nerfc")
 # compare_functions(t.erfc, ttt.erfc, 1)
 # compare_functions(t.erfc, ttt.erfc, -1)
@@ -180,3 +183,61 @@ print(f"p: (mu={p_py.mu:.16f}, sigma={p_py.sigma:.16f})")
 print(f"posterior_win: (mu={posterior_win_py.mu:.16f}, sigma={posterior_win_py.sigma:.16f})")
 print(f"posterior_lose: (mu={posterior_lose_py.mu:.16f}, sigma={posterior_lose_py.sigma:.16f})")
 print(f"likelihood: (mu={likelihood_py.mu:.16f}, sigma={likelihood_py.sigma:.16f})")
+print()
+# Create players with the same parameters in both libraries
+mu1, sigma1 = 25.0, 8.0
+mu2, sigma2 = 30.0, 4.0
+mu3, sigma3 = 20.0, 6.0
+
+# Python players
+player1_py = t.Player(t.Gaussian(mu1, sigma1))
+player2_py = t.Player(t.Gaussian(mu2, sigma2))
+player3_py = t.Player(t.Gaussian(mu3, sigma3))
+
+# Nim players
+player1_nim = ttt.newPlayer(ttt.gaussian(mu1, sigma1))
+player2_nim = ttt.newPlayer(ttt.gaussian(mu2, sigma2))
+player3_nim = ttt.newPlayer(ttt.gaussian(mu3, sigma3))
+
+# Create game: team1 = [player1_py, player2_py] vs team2 = [player3_py]
+# team1 wins (result=[1, 0])
+teams_py = [[player1_py, player2_py], [player3_py]]
+teams_nim = [[player1_nim, player2_nim], [player3_nim]]
+result = [1, 0]  # team1 wins
+p_draw = 0.1
+
+# Python game
+game_py = t.Game(teams_py, result, p_draw)
+game_py.compute_likelihoods()
+evidence_py = game_py.evidence
+likelihoods_py = game_py.likelihoods
+
+# Nim game
+game_nim = ttt.newGame(teams_nim, result, p_draw)
+(likelihoods_nim, evidence_nim) = ttt.compute_likelihoods(game_nim)
+
+# Compare evidence
+print(f"Evidence match: {abs(evidence_py - evidence_nim) < 1e-9} (Python: {evidence_py}, Nim: {evidence_nim})")
+
+# Compare likelihoods
+for i in range(len(teams_py)):
+    for j in range(len(teams_py[i])):
+        l_py = likelihoods_py[i][j]
+        l_nim = likelihoods_nim[i][j]
+        match = compare_gaussians((l_py.mu, l_py.sigma), l_nim)
+        print(f"Team {i}, Player {j} likelihood match: {match}")
+        print(f"  Python: mu={l_py.mu}, sigma={l_py.sigma}")
+        print(f"  Nim:    mu={l_nim[0]}, sigma={l_nim[1]}")
+
+# Compare posteriors
+posteriors_py = game_py.posteriors()
+posteriors_nim = ttt.posteriors(game_nim, likelihoods_nim)
+
+for i in range(len(teams_py)):
+    for j in range(len(teams_py[i])):
+        p_py = posteriors_py[i][j]
+        p_nim = posteriors_nim[i][j]
+        match = compare_gaussians((p_py.mu, p_py.sigma), p_nim)
+        print(f"Team {i}, Player {j} posterior match: {match}")
+        print(f"  Python: mu={p_py.mu}, sigma={p_py.sigma}")
+        print(f"  Nim:    mu={p_nim[0]}, sigma={p_nim[1]}")

@@ -207,7 +207,27 @@ proc max_tuple*(t1, t2: tuple[a, b: float]): tuple[a, b: float] {.exportpy.} =
 proc gr_tuple*(tup: tuple[a, b: float], threshold: float): bool {.exportpy.} =
     tup.a > threshold or tup.b > threshold
 
-proc sortperm*(xs: seq[float], reverse: bool = false): seq[int] {.exportpy.} =
+# Integer version of sortperm
+proc sortperm_int*(xs: seq[int], reverse: bool = false): seq[int] {.exportpy.} =
+    var indexed = newSeq[(int, int)](xs.len)
+    for i, x in xs:
+        indexed[i] = (x, i)
+    
+    indexed.sort(proc (a, b: (int, int)): int =
+        if a[0] < b[0]: -1
+        elif a[0] > b[0]: 1
+        else: 0
+    )
+    
+    if reverse:
+        indexed.reverse()
+    
+    result = newSeq[int](xs.len)
+    for i in 0..<indexed.len:
+        result[i] = indexed[i][1]
+
+# Float version of sortperm (for podium function)
+proc sortperm_float*(xs: seq[float], reverse: bool = false): seq[int] {.exportpy.} =
     var indexed = newSeq[(float, int)](xs.len)
     for i, x in xs:
         indexed[i] = (x, i)
@@ -225,8 +245,9 @@ proc sortperm*(xs: seq[float], reverse: bool = false): seq[int] {.exportpy.} =
     for i in 0..<indexed.len:
         result[i] = indexed[i][1]
 
+# Update podium to use float version
 proc podium*(xs: seq[float]): seq[int] {.exportpy.} =
-    sortperm(xs)
+    sortperm_float(xs)
 
 proc dict_diff*(old_dict: PyObject, new_dict: PyObject): tuple[a, b: float] {.exportpy.} =
     var step = (0.0, 0.0)
@@ -360,3 +381,298 @@ proc newDiffMessages*(
 # Diff Messages operations
 proc diff_messages_p*(dm: DiffMessages): GaussianTuple {.exportpy.} =
     gaussian_mul(dm.prior, dm.likelihood)
+
+type Game* = tuple
+    teams: seq[seq[Player]]
+    game_result: seq[int]
+    p_draw: float
+    weights: seq[seq[float]]
+
+proc newGame*(
+    teams: seq[seq[Player]], 
+    game_result: seq[int] = @[],  # Renamed from 'result'
+    p_draw: float = 0.0, 
+    weights: seq[seq[float]] = @[]
+): Game {.exportpy.} =
+    # Default game_result if not provided
+    var actual_result = game_result
+    if len(actual_result) == 0:
+        actual_result = newSeq[int](len(teams))
+        for i in 0..<len(teams):
+            actual_result[i] = len(teams) - i - 1
+    
+    # Default weights if not provided
+    var actual_weights = weights
+    if len(actual_weights) == 0:
+        actual_weights = newSeq[seq[float]](len(teams))
+        for i in 0..<len(teams):
+            actual_weights[i] = newSeq[float](len(teams[i]))
+            for j in 0..<len(teams[i]):
+                actual_weights[i][j] = 1.0
+    
+    (teams: teams, game_result: actual_result, p_draw: p_draw, weights: actual_weights)
+
+proc game_len*(game: Game): int {.exportpy.} =
+    len(game.teams)
+
+proc game_size*(game: Game): seq[int] {.exportpy.} =
+    result = newSeq[int](len(game.teams))
+    for i in 0..<len(game.teams):
+        result[i] = len(game.teams[i])
+
+proc performance*(game: Game, i: int): GaussianTuple {.exportpy.} =
+    team_performance(game.teams[i], game.weights[i])
+
+proc graphical_model*(game: Game): tuple[
+    o: seq[int], 
+    t: seq[TeamVariable], 
+    d: seq[DiffMessages], 
+    tie: seq[bool], 
+    margin: seq[float],
+    evidence: float
+] {.exportpy.} =
+    var o = sortperm_int(game.game_result, reverse = true)
+    var t = newSeq[TeamVariable]()
+    for e in 0..<game_len(game):
+        t.add(newTeamVariable(prior=team_performance(game.teams[o[e]], game.weights[o[e]])))
+    
+    var d = newSeq[DiffMessages]()
+    for e in 0..<len(t)-1:
+        let diff = gaussian_sub(t[e].prior, t[e+1].prior)
+        d.add(newDiffMessages(prior=diff))
+    
+    var tie = newSeq[bool]()
+    for e in 0..<len(d):
+        tie.add(game.game_result[o[e]] == game.game_result[o[e+1]])
+    
+    var margin = newSeq[float]()
+    for e in 0..<len(d):
+        if game.p_draw == 0.0:
+            margin.add(0.0)
+        else:
+            var sd = 0.0
+            for player in game.teams[o[e]]:
+                sd += player.beta * player.beta
+            for player in game.teams[o[e+1]]:
+                sd += player.beta * player.beta
+            sd = sqrt(sd)
+            margin.add(compute_margin(game.p_draw, sd))
+    
+    # Correct evidence calculation
+    var evidence = 1.0
+    for e in 0..<len(d):
+        let (mu, sigma) = d[e].prior
+        if tie[e]:
+            evidence *= (cdf(margin[e], mu, sigma) - cdf(-margin[e], mu, sigma))
+        else:
+            evidence *= (1.0 - cdf(margin[e], mu, sigma))
+    
+    result = (o: o, t: t, d: d, tie: tie, margin: margin, evidence: evidence)
+
+proc partial_evidence*(
+    d: GaussianTuple, 
+    margin: float, 
+    tie: bool, 
+    evidence: float
+): float {.exportpy.} =
+    let (mu, sigma) = d
+    if tie:
+        evidence * (cdf(margin, mu, sigma) - cdf(-margin, mu, sigma))
+    else:
+        evidence * (1.0 - cdf(margin, mu, sigma))
+
+proc likelihood_analitico*(game: Game): tuple[likelihoods: seq[seq[GaussianTuple]], evidence: float] {.exportpy.} =
+    let (o, t, d, tie, margin, evidence) = graphical_model(game)
+    
+    # The evidence is already calculated, so we can use it directly
+    var partial_ev = evidence
+    
+    # Rest of the implementation remains the same...
+    let d0 = d[0].prior
+    let (mu_trunc, sigma_trunc) = trunc(d0.mu, d0.sigma, margin[0], tie[0])
+    
+    # Calculate the analytical solution for each player
+    var likelihoods = newSeq[seq[GaussianTuple]]()
+    for i in 0..<game_len(game):
+        var team_likelihoods = newSeq[GaussianTuple]()
+        for j in 0..<len(game.teams[i]):
+            let player = game.teams[o[i]][j]
+            let w = game.weights[o[i]][j]
+            
+            # Calculate the new Gaussian parameters
+            var new_mu: float
+            var new_sigma: float
+            
+            if d0.sigma == sigma_trunc:
+                new_mu = player.prior.mu
+                new_sigma = player.prior.sigma
+            else:
+                # Calculate the parameters for the analytical solution
+                let delta_div = (d0.sigma*d0.sigma*mu_trunc - sigma_trunc*sigma_trunc*d0.mu) /
+                                (d0.sigma*d0.sigma - sigma_trunc*sigma_trunc)
+                let theta_div_pow2 = (sigma_trunc*sigma_trunc * d0.sigma*d0.sigma) /
+                                     (d0.sigma*d0.sigma - sigma_trunc*sigma_trunc)
+                
+                new_mu = player.prior.mu + (delta_div - d0.mu) * pow(-1.0, float(i == 1))
+                new_sigma = sqrt(theta_div_pow2 + d0.sigma*d0.sigma - player.prior.sigma*player.prior.sigma)
+            
+            team_likelihoods.add((new_mu, new_sigma))
+        likelihoods.add(team_likelihoods)
+    
+    # Reorder likelihoods if needed
+    if o[0] > o[1]:
+        swap(likelihoods[0], likelihoods[1])
+    
+    (likelihoods: likelihoods, evidence: partial_ev)
+
+proc likelihood_teams*(game: Game): tuple[likelihoods: seq[seq[GaussianTuple]], evidence: float] {.exportpy.} =
+    let (o, t, d, tie, margin, evidence) = graphical_model(game)
+    
+    var current_t = t
+    var current_d = d
+    var step = (inf, inf)
+    var i = 0
+    let max_iter = 10
+    let epsilon = 1e-6
+    
+    while gr_tuple(step, epsilon) and i < max_iter:
+        step = (0.0, 0.0)
+        
+        # Forward pass
+        for e in 0..<len(current_d)-1:
+            # Update difference prior
+            let post_win = team_variable_posterior_win(current_t[e])
+            let post_lose = team_variable_posterior_lose(current_t[e+1])
+            let new_prior = gaussian_sub(post_win, post_lose)
+            
+            # Update difference message
+            var new_d_e = current_d[e]
+            new_d_e.prior = new_prior
+            
+            # Compute likelihood
+            let approx_gauss = approx(new_prior, margin[e], tie[e])
+            let likelihood_diff = gaussian_div(approx_gauss, new_prior)
+            new_d_e.likelihood = likelihood_diff
+            
+            # Compute new likelihood_lose for next team
+            let new_likelihood_lose = gaussian_sub(post_win, likelihood_diff)
+            
+            # Update step
+            let delta = gaussian_delta(new_likelihood_lose, current_t[e+1].likelihood_lose)
+            step = max_tuple(step, delta)
+            
+            # Update team variable
+            var new_t_e1 = current_t[e+1]
+            new_t_e1.likelihood_lose = new_likelihood_lose
+            current_t[e+1] = new_t_e1
+            current_d[e] = new_d_e
+        
+        # Backward pass
+        for e in countdown(len(current_d)-1, 1):
+            # Update difference prior
+            let post_win = team_variable_posterior_win(current_t[e])
+            let post_lose = team_variable_posterior_lose(current_t[e+1])
+            let new_prior = gaussian_sub(post_win, post_lose)
+            
+            # Update difference message
+            var new_d_e = current_d[e]
+            new_d_e.prior = new_prior
+            
+            # Compute likelihood
+            let approx_gauss = approx(new_prior, margin[e], tie[e])
+            let likelihood_diff = gaussian_div(approx_gauss, new_prior)
+            new_d_e.likelihood = likelihood_diff
+            
+            # Compute new likelihood_win for previous team
+            let new_likelihood_win = gaussian_add(post_lose, likelihood_diff)
+            
+            # Update step
+            let delta = gaussian_delta(new_likelihood_win, current_t[e].likelihood_win)
+            step = max_tuple(step, delta)
+            
+            # Update team variable
+            var new_t_e = current_t[e]
+            new_t_e.likelihood_win = new_likelihood_win
+            current_t[e] = new_t_e
+            current_d[e] = new_d_e
+        
+        i += 1
+    
+    # Handle the last difference if it exists
+    if len(current_d) > 0:
+        let e = 0
+        let post_win = team_variable_posterior_win(current_t[e])
+        let post_lose = team_variable_posterior_lose(current_t[e+1])
+        let new_prior = gaussian_sub(post_win, post_lose)
+        
+        var new_d_e = current_d[e]
+        new_d_e.prior = new_prior
+        
+        let approx_gauss = approx(new_prior, margin[e], tie[e])
+        let likelihood_diff = gaussian_div(approx_gauss, new_prior)
+        new_d_e.likelihood = likelihood_diff
+        
+        # Update first team's likelihood_win
+        let new_likelihood_win = gaussian_add(post_lose, likelihood_diff)
+        var new_t0 = current_t[0]
+        new_t0.likelihood_win = new_likelihood_win
+        current_t[0] = new_t0
+        
+        # Update last team's likelihood_lose
+        let last_index = len(current_t)-1
+        let last_d_index = len(current_d)-1
+        let last_post_win = team_variable_posterior_win(current_t[last_index-1])
+        let last_likelihood_lose = gaussian_sub(last_post_win, current_d[last_d_index].likelihood)
+        var new_t_last = current_t[last_index]
+        new_t_last.likelihood_lose = last_likelihood_lose
+        current_t[last_index] = new_t_last
+    
+    # Compute likelihoods for each player
+    var likelihoods = newSeq[seq[GaussianTuple]]()
+    for e in 0..<game_len(game):
+        let team_likelihood = team_variable_likelihood(current_t[e])
+        var player_likelihoods = newSeq[GaussianTuple]()
+        
+        let team_perf = team_performance(game.teams[o[e]], game.weights[o[e]])
+        for i in 0..<len(game.teams[o[e]]):
+            let player = game.teams[o[e]][i]
+            let w = game.weights[o[e]][i]
+            let player_perf = player_performance(player)
+            let scaled_player_perf = gaussian_scale(player_perf, w)
+            let other_perf = gaussian_exclude(team_perf, scaled_player_perf)
+            let player_team_likelihood = gaussian_div(team_likelihood, other_perf)
+            let player_likelihood = gaussian_scale(player_team_likelihood, 1.0 / w)
+            player_likelihoods.add(player_likelihood)
+        
+        likelihoods.add(player_likelihoods)
+    
+    (likelihoods: likelihoods, evidence: evidence)
+
+proc compute_likelihoods*(game: Game): tuple[likelihoods: seq[seq[GaussianTuple]], evidence: float] {.exportpy.} =
+    # Check if we can use the analytical method
+    if game_len(game) == 2:
+        var all_weights_one = true
+        for team_weights in game.weights:
+            for w in team_weights:
+                if w != 1.0:
+                    all_weights_one = false
+                    break
+            if not all_weights_one:
+                break
+        
+        if all_weights_one:
+            return likelihood_analitico(game)
+    
+    # Otherwise use the team-based method
+    return likelihood_teams(game)
+
+proc posteriors*(game: Game, likelihoods: seq[seq[GaussianTuple]]): seq[seq[GaussianTuple]] {.exportpy.} =
+    var posteriors = newSeq[seq[GaussianTuple]]()
+    for e in 0..<len(game.teams):
+        var team_posteriors = newSeq[GaussianTuple]()
+        for i in 0..<len(game.teams[e]):
+            let prior = game.teams[e][i].prior
+            let likelihood = likelihoods[e][i]
+            team_posteriors.add(gaussian_mul(prior, likelihood))
+        posteriors.add(team_posteriors)
+    posteriors
