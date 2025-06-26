@@ -705,13 +705,19 @@ proc newBatch*(
     let eventWeights = if weights.len > 0: weights[e] else: @[]
     events.add(newEvent(teams, 1.0, eventWeights))  # Start evidence at 1.0
   
-  Batch(
+  # Create batch
+  var batch = Batch(
     skills: skills,
     events: events,
     time: time,
     agents: agents,
     pDraw: pDraw
   )
+  
+  # Perform initial iteration (MISSING STEP)
+  batch.iteration()
+  
+  batch
 
 
 type
@@ -770,23 +776,39 @@ proc posteriors*(h: History): TableRef[string, Gaussian] =
 proc convergence*(h: History, epsilon: float = EPSILON, iterations: int = ITERATIONS, verbose: bool = true): (float, float, int) =
   var step: (float, float) = (Inf, Inf)
   var i = 0
-  while i < iterations and step.grTuple(epsilon):
+  while i < iterations:
     if verbose:
       echo "Iteration ", i
-    let oldPosteriors = h.posteriors()
+    
+    # Store current state for comparison
+    var oldPosteriors = newTable[string, Gaussian]()
+    for batch in h.batches:
+      let batchPost = batch.posteriors()
+      for agent, gaussian in batchPost:
+        oldPosteriors[agent] = gaussian
+    
+    # Run iteration
     h.iteration()
-    # Calculate max change across all batches
+    
+    # Calculate max change
     step = (0.0, 0.0)
     for batch in h.batches:
       let newPost = batch.posteriors()
-      for agent in batch.skills.keys:
+      for agent in newPost.keys:
         let oldG = oldPosteriors.getOrDefault(agent, Ninf)
-        let newG = newPost.getOrDefault(agent, Ninf)
+        let newG = newPost[agent]
         let delta = oldG.delta(newG)
         step = maxTuple(step, delta)
+    
     if verbose:
       echo "  Step: mu=", step[0], " sigma=", step[1]
-    i += 1
+    
+    # Check convergence
+    if not step.grTuple(epsilon):
+      break
+      
+    i.inc
+  
   if verbose:
     echo "Converged in ", i, " iterations"
   (step[0], step[1], i)
@@ -950,6 +972,7 @@ when isMainModule:
 
   let initialCurves = history.learningCurves()
   echo initialCurves["a"]
+  echo initialCurves["b"]
 
   # Run convergence
   echo "Running convergence..."
